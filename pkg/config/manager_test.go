@@ -167,6 +167,13 @@ func testConfigManager(t *testing.T, mgr *Manager, mt mtest, loopDelay time.Dura
 		if le == nil && called != 1 {
 			t.Errorf("called Got: %d, want: 1", called)
 		}
+
+		// fakeMemStore supports ChangeNotifier, thus mgr does not need
+		// to invoke List() unnecessarily.
+		listCallCount := mgr.store.(*fakeMemStore).listCallCount
+		if listCallCount != 1 {
+			t.Errorf("call count of List %d, want: 1", listCallCount)
+		}
 		return
 	}
 
@@ -186,7 +193,8 @@ type fakeMemStore struct {
 	cl StoreListener
 	sync.RWMutex
 
-	listKeys []string
+	listKeys      []string
+	listCallCount int
 }
 
 var _ KeyValueStore = &fakeMemStore{}
@@ -231,6 +239,7 @@ func (f *fakeMemStore) Set(key string, value string) (index int, err error) {
 func (f *fakeMemStore) List(key string, recurse bool) (keys []string, index int, err error) {
 	f.RLock()
 	defer f.RUnlock()
+	f.listCallCount++
 	if f.err != nil {
 		return nil, f.index, f.err
 	}
