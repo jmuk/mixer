@@ -63,6 +63,7 @@ type Manager struct {
 
 	ticker         *time.Ticker
 	lastFetchIndex int
+	notifiedIndex  int
 
 	cl []ChangeListener
 
@@ -104,11 +105,12 @@ func NewManager(eval expr.Evaluator, aspectFinder AspectValidatorFinder, builder
 	return m
 }
 
-// StoreChange is called by "store" when new changes are available
-//func (c *Manager) StoreChange(index int) {
-//	// fetchAndNotify already logs errors
-//	c.fetchAndNotify()
-//}
+// NotifyStoreChanged is called by "store" when new changes are available
+func (c *Manager) NotifyStoreChanged(index int) {
+	if c.notifiedIndex == indexNotSupported {
+		c.notifiedIndex = index
+	}
+}
 
 // Register makes the ConfigManager aware of a ConfigChangeListener.
 func (c *Manager) Register(cc ChangeListener) {
@@ -146,7 +148,7 @@ func readdb(store KeyValueStore, prefix string) (map[string]string, map[string][
 
 // fetch config and return runtime if a new one is available.
 func (c *Manager) fetch() (*runtime, descriptor.Finder, error) {
-
+	// TODO: use ChangeLogReader with c.notifiedIndex
 	data, shas, index, err := readdb(c.store, "/")
 	if glog.V(9) {
 		glog.Info(data)
@@ -211,15 +213,19 @@ func (c *Manager) Close() {
 
 func (c *Manager) loop() {
 	for range c.ticker.C {
-		c.fetchAndNotify()
+		if c.notifiedIndex == indexNotSupported || c.notifiedIndex > c.lastFetchIndex {
+			c.fetchAndNotify()
+		}
 	}
 }
 
 // Start watching for configuration changes and handle updates.
 func (c *Manager) Start() {
 	c.fetchAndNotify()
-	// FIXME add change notifier registration once we have
-	// an adapter that supports it cn.RegisterStoreChangeListener(c)
+	c.notifiedIndex = c.lastFetchIndex
+	if cn, ok := c.store.(ChangeNotifier); ok {
+		cn.RegisterStoreChangeListener(c)
+	}
 
 	// if store does not support notification use the loop
 	// If it is not successful, we will continue to watch for changes.
