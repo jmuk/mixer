@@ -9,6 +9,37 @@ go_prefix("istio.io/api")
 load("@org_pubref_rules_protobuf//gogo:rules.bzl", "gogoslick_proto_library")
 
 gogoslick_proto_library(
+    name = "config/v1",
+    importmap = {
+        "google/protobuf/empty.proto": "github.com/gogo/protobuf/types",
+        "google/protobuf/struct.proto": "github.com/gogo/protobuf/types",
+        "google/api/annotations.proto": "github.com/googleapis/googleapis/google/api/annotations",
+        "google/rpc/status.proto": "github.com/googleapis/googleapis/google/rpc",
+    },
+    imports = [
+        "../../external/com_github_google_protobuf/src",
+        "../../external/com_github_googleapis_googleapis",
+    ],
+    inputs = [
+        "@com_github_google_protobuf//:well_known_protos",
+        "@com_github_googleapis_googleapis//:annotations_proto",
+        "@com_github_googleapis_googleapis//:status_proto",
+    ],
+    protos = [
+        "config/v1/service.proto",
+    ],
+    verbose = 0,
+    visibility = ["//visibility:public"],
+    with_grpc = True,
+    deps = [
+        "@com_github_gogo_protobuf//sortkeys:go_default_library",
+        "@com_github_gogo_protobuf//types:go_default_library",
+        "@com_github_googleapis_googleapis//:google/api/annotations",
+        "@com_github_googleapis_googleapis//:google/rpc",
+    ],
+)
+
+gogoslick_proto_library(
     name = "mixer/v1",
     importmap = {
         "gogoproto/gogo.proto": "github.com/gogo/protobuf/gogoproto",

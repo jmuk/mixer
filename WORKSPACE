@@ -27,6 +27,13 @@ cpp_proto_repositories()
 
 gogo_proto_repositories()
 
+# TODO: upstream to gogo.
+new_go_repository(
+    name = "com_github_gogo_protobuf",
+    commit = "efccd33a0c20aa078705571d5ddbfa14c8395a63",  # Jun 6, 2017
+    importpath = "github.com/gogo/protobuf",
+)
+
 new_go_repository(
     name = "com_github_golang_glog",
     commit = "23def4e6c14b4da8ac2ed8007337bc5eb5007998",  # Jan 26, 2016 (no releases)
@@ -58,6 +65,27 @@ load("@io_bazel_rules_go//go:def.bzl", "go_prefix")
 go_prefix("github.com/googleapis/googleapis")
 
 load("@org_pubref_rules_protobuf//gogo:rules.bzl", "gogoslick_proto_library")
+
+gogoslick_proto_library(
+    name = "google/api/annotations",
+    protos = [
+        "google/api/annotations.proto",
+        "google/api/http.proto",
+    ],
+    importmap = {
+        "google/protobuf/descriptor.proto": "github.com/golang/protobuf/protoc-gen-go/descriptor",
+    },
+    imports = [
+        "../../external/com_github_google_protobuf/src",
+    ],
+    inputs = [
+        "@com_github_google_protobuf//:well_known_protos",
+    ],
+    deps = [
+        "@com_github_golang_protobuf//protoc-gen-go/descriptor:go_default_library",
+    ],
+    verbose = 0,
+)
 
 gogoslick_proto_library(
     name = "google/rpc",
@@ -93,6 +121,14 @@ cc_proto_library(
         "../../external/com_github_google_protobuf/src",
     ],
     verbose = 0,
+)
+
+filegroup(
+    name = "annotations_proto",
+    srcs = [
+        "google/api/annotations.proto",
+        "google/api/http.proto",
+    ],
 )
 
 filegroup(
@@ -182,7 +218,7 @@ new_git_or_local_repository(
     path = "../api",
     remote = "https://github.com/istio/api.git",
     # Change this to True to use ../api directory
-    use_local = False,
+    use_local = True,
 )
 
 new_http_archive(

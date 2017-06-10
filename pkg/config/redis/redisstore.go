@@ -344,6 +344,9 @@ func (sub *subscriber) Close() {
 
 // RegisterListener implements a ChangeNotifier method.
 func (sub *subscriber) RegisterListener(s store.Listener) {
+	if sub == nil {
+		return
+	}
 	sub.mu.Lock()
 	sub.listener = s
 	sub.mu.Unlock()
