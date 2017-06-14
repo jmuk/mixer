@@ -84,7 +84,7 @@ func NewConfigAPIServer(url string, interval time.Duration) (configpb.ServiceSer
 }
 
 func (s *configAPIServer) buildPath(meta *configpb.Meta) string {
-	var paths = []string{meta.ApiGroup, meta.ObjectType, meta.ObjectGroup}
+	var paths = []string{meta.ApiGroup, meta.ApiGroupVersion, meta.ObjectType, meta.ObjectGroup}
 	if len(meta.Name) != 0 {
 		paths = append(paths, meta.Name)
 	}
@@ -96,14 +96,15 @@ func (s *configAPIServer) pathToMeta(path string) (*configpb.Meta, error) {
 		return nil, fmt.Errorf("illformed path %s", path)
 	}
 	paths := strings.Split(path[1:], "/")
-	if len(paths) < 4 {
+	if len(paths) < 5 {
 		return nil, fmt.Errorf("insufficient path components: %s", path)
 	}
 	return &configpb.Meta{
-		ApiGroup:    paths[0],
-		ObjectType:  paths[1],
-		ObjectGroup: paths[2],
-		Name:        strings.Join(paths[3:], "/"),
+		ApiGroup:        paths[0],
+		ApiGroupVersion: paths[1],
+		ObjectType:      paths[2],
+		ObjectGroup:     paths[3],
+		Name:            strings.Join(paths[4:], "/"),
 	}, nil
 }
 
@@ -172,7 +173,33 @@ func (s *configAPIServer) ListObjects(ctx context.Context, req *configpb.ListObj
 }
 
 func (s *configAPIServer) ListObjectTypes(ctx context.Context, req *configpb.ListObjectTypesRequest) (resp *configpb.ObjectTypeList, err error) {
-	return nil, nil
+	var prefix string
+	if req.Meta == nil || (req.Meta.ApiGroup == "" && req.Meta.ApiGroupVersion == "") {
+		prefix = "/"
+	} else {
+		prefix = fmt.Sprintf("/%s/%s/", req.Meta.ApiGroup, req.Meta.ApiGroupVersion)
+	}
+	keys, _, err := s.kvs.List(prefix, true)
+	resp = &configpb.ObjectTypeList{
+		Meta:        req.Meta,
+		ObjectTypes: make([]*configpb.Meta, 0, len(keys)),
+	}
+	known := map[string]bool{}
+	for _, k := range keys {
+		m, err := s.pathToMeta(k)
+		if err != nil {
+			glog.Infof("can't parse key %s: %v", k, err)
+			continue
+		}
+		m.Name = ""
+		mKey := s.buildPath(m)
+		if _, ok := known[mKey]; ok {
+			continue
+		}
+		known[mKey] = true
+		resp.ObjectTypes = append(resp.ObjectTypes, m)
+	}
+	return resp, nil
 }
 
 func (s *configAPIServer) CreateObject(ctx context.Context, req *configpb.CreateObjectRequest) (resp *configpb.Object, err error) {
