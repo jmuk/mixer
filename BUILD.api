@@ -25,6 +25,10 @@ gogoslick_proto_library(
         "@com_github_googleapis_googleapis//:annotations_proto",
         "@com_github_googleapis_googleapis//:status_proto",
     ],
+    langs = [
+        "@org_pubref_rules_protobuf//gogo:gogoslick",
+        "@org_pubref_rules_protobuf//grpc_gateway",
+    ],
     protos = [
         "config/v1/service.proto",
     ],
@@ -34,8 +38,13 @@ gogoslick_proto_library(
     deps = [
         "@com_github_gogo_protobuf//sortkeys:go_default_library",
         "@com_github_gogo_protobuf//types:go_default_library",
+        "@com_github_golang_protobuf//proto:go_default_library",
         "@com_github_googleapis_googleapis//:google/api/annotations",
         "@com_github_googleapis_googleapis//:google/rpc",
+        "@com_github_grpc_ecosystem_grpc_gateway//runtime:go_default_library",
+        "@com_github_grpc_ecosystem_grpc_gateway//utilities:go_default_library",
+        "@org_golang_google_grpc//codes:go_default_library",
+        "@org_golang_google_grpc//grpclog:go_default_library",
     ],
 )
 

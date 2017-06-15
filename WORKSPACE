@@ -58,6 +58,10 @@ new_go_repository(
     importpath = "github.com/golang/protobuf",
 )
 
+load("@org_pubref_rules_protobuf//grpc_gateway:rules.bzl", "grpc_gateway_proto_repositories")
+
+grpc_gateway_proto_repositories()
+
 GOOGLEAPIS_BUILD_FILE = """
 package(default_visibility = ["//visibility:public"])
 

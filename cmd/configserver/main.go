@@ -15,12 +15,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"time"
 
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	bt "github.com/opentracing/basictracer-go"
 	ot "github.com/opentracing/opentracing-go"
@@ -30,16 +33,37 @@ import (
 	configpb "istio.io/api/config/v1"
 	"istio.io/mixer/cmd/shared"
 	"istio.io/mixer/pkg/config"
+	"istio.io/mixer/pkg/config/store"
 	"istio.io/mixer/pkg/tracing"
 )
 
 var (
 	configStoreURL string
 	port           uint16
+	gatewayPort    uint16
 	enableTracing  bool
 	duration       int
 	maxMessageSize uint
 )
+
+func runGateway() error {
+	ctx := context.Background()
+
+	mux := runtime.NewServeMux()
+	opts := []grpc.DialOption{
+		grpc.WithInsecure(),
+		// grpc.WithMaxMsgSize(int(maxMessageSize)),
+		grpc.WithCompressor(grpc.NewGZIPCompressor()),
+		grpc.WithDecompressor(grpc.NewGZIPDecompressor()),
+	}
+	err := configpb.RegisterServiceHandlerFromEndpoint(ctx, mux, fmt.Sprintf("localhost:%d", port), opts)
+	if err != nil {
+		return err
+	}
+
+	go http.ListenAndServe(fmt.Sprintf(":%d", gatewayPort), mux)
+	return nil
+}
 
 func runServer() {
 	var listener net.Listener
@@ -49,9 +73,22 @@ func runServer() {
 		shared.Fatalf("Unable to listen on socket: %v", err)
 	}
 
-	s, err := config.NewConfigAPIServer(configStoreURL, time.Duration(duration)*time.Millisecond)
+	if err := runGateway(); err != nil {
+		shared.Fatalf("Failed to start up the gateway: %v", err)
+	}
+
+	kvs, err := store.NewRegistry(config.StoreInventory()...).NewStore(configStoreURL)
 	if err != nil {
-		shared.Fatalf("can't establish the connection with the server %s: %v", configStoreURL, err)
+		shared.Fatalf("failed to connect to the store: %v", err)
+	}
+	s, err := config.NewConfigAPIServer(kvs)
+	if err != nil {
+		shared.Fatalf("failed to create a server: %v", err)
+	}
+
+	w, err := config.NewConfigWatcherServer(kvs, time.Duration(duration)*time.Millisecond)
+	if err != nil {
+		shared.Fatalf("failed to create a watcher: %v", err)
 	}
 
 	grpcOptions := []grpc.ServerOption{
@@ -69,6 +106,7 @@ func runServer() {
 	}
 	gs := grpc.NewServer(grpcOptions...)
 	configpb.RegisterServiceServer(gs, s)
+	configpb.RegisterWatcherServer(gs, w)
 
 	if err = gs.Serve(listener); err != nil {
 		shared.Fatalf("Failed serving gRPC server: %v", err)
@@ -92,6 +130,7 @@ func main() {
 		},
 	}
 	rootCmd.PersistentFlags().Uint16VarP(&port, "port", "p", 9099, "TCP port to use for configserver's gRPC API")
+	rootCmd.PersistentFlags().Uint16Var(&gatewayPort, "gateway-port", 9199, "TCP port for the JSON/REST gateway for the API")
 	rootCmd.PersistentFlags().IntVar(&duration, "interval", 500, "The interval to emit changes")
 	rootCmd.PersistentFlags().StringVar(&configStoreURL, "configStoreURL", "", "The URL for the backend config store")
 	rootCmd.PersistentFlags().BoolVar(&enableTracing, "enable-tracing", false, "enable tracing")

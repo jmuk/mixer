@@ -32,7 +32,7 @@ import (
 )
 
 type watcher struct {
-	stream               configpb.Service_WatchServer
+	stream               configpb.Watcher_WatchServer
 	keyPrefix            string
 	sendPut              bool
 	sendDelete           bool
@@ -42,37 +42,41 @@ type watcher struct {
 type configAPIServer struct {
 	// TODO: allow multiple kvs.
 	kvs store.KeyValueStore
+}
+
+type configWatcherServer struct {
+	kvs store.KeyValueStore
 	cr  store.ChangeLogReader
 
 	lastNotifiedIndex int
 	lastFetchedIndex  int
-
-	nextWatcherID int64
-	watchers      map[int64]*watcher
-	mu            sync.Mutex
+	nextWatcherID     int64
+	watchers          map[int64]*watcher
+	mu                sync.Mutex
 }
 
 var _ configpb.ServiceServer = &configAPIServer{}
+var _ configpb.WatcherServer = &configWatcherServer{}
 
-// NewConfigAPIServer creates a new configpb.ServiceServer instance whose
-// storage backend is specified as the url.
-func NewConfigAPIServer(url string, interval time.Duration) (configpb.ServiceServer, error) {
-	kvs, err := store.NewRegistry(StoreInventory()...).NewStore(url)
-	if err != nil {
-		return nil, err
-	}
-	s := &configAPIServer{kvs: kvs, watchers: map[int64]*watcher{}}
+// NewConfigAPIServer creates a new configpb.ServiceServer instance with the
+// specified storage.
+func NewConfigAPIServer(kvs store.KeyValueStore) (configpb.ServiceServer, error) {
+	return &configAPIServer{kvs}, nil
+}
+
+// NewConfigWatcherServer creates a new configpb.WatcherServer instance with
+// the specified storage.
+func NewConfigWatcherServer(kvs store.KeyValueStore, interval time.Duration) (configpb.WatcherServer, error) {
+	s := &configWatcherServer{kvs: kvs, watchers: map[int64]*watcher{}}
 	if cn, ok := kvs.(store.ChangeNotifier); ok {
 		cn.RegisterListener(s)
 	} else {
-		kvs.Close()
-		return nil, fmt.Errorf("config store %s is not a change notifier", url)
+		return nil, fmt.Errorf("config store %s is not a change notifier", kvs)
 	}
 	if cr, ok := kvs.(store.ChangeLogReader); ok {
 		s.cr = cr
 	} else {
-		kvs.Close()
-		return nil, fmt.Errorf("config store %s is not changelog readable", url)
+		return nil, fmt.Errorf("config store %s is not changelog readable", kvs)
 	}
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -83,7 +87,7 @@ func NewConfigAPIServer(url string, interval time.Duration) (configpb.ServiceSer
 	return s, nil
 }
 
-func (s *configAPIServer) buildPath(meta *configpb.Meta) string {
+func buildPath(meta *configpb.Meta) string {
 	var paths = []string{meta.ApiGroup, meta.ApiGroupVersion, meta.ObjectType, meta.ObjectGroup}
 	if len(meta.Name) != 0 {
 		paths = append(paths, meta.Name)
@@ -91,7 +95,7 @@ func (s *configAPIServer) buildPath(meta *configpb.Meta) string {
 	return "/" + strings.Join(paths, "/")
 }
 
-func (s *configAPIServer) pathToMeta(path string) (*configpb.Meta, error) {
+func pathToMeta(path string) (*configpb.Meta, error) {
 	if path[0] != '/' {
 		return nil, fmt.Errorf("illformed path %s", path)
 	}
@@ -108,56 +112,41 @@ func (s *configAPIServer) pathToMeta(path string) (*configpb.Meta, error) {
 	}, nil
 }
 
-func (s *configAPIServer) buildObject(data string, meta *configpb.Meta, selector *configpb.ObjectFieldInclude) (obj *configpb.Object, err error) {
-	src := &pb.Struct{Fields: map[string]*pb.Value{}}
+func buildObject(data string, meta *configpb.Meta, incl *configpb.ObjectFieldInclude) (obj *configpb.Object, err error) {
+	src := &pb.Struct{}
 	err = jsonpb.UnmarshalString(data, src)
 	if err != nil {
 		return nil, err
 	}
 	obj = &configpb.Object{Meta: meta}
-	if selector != nil && selector.SourceData {
+	if incl != nil && incl.SourceData {
 		obj.SourceData = src
 	}
-	if selector != nil && selector.Data {
+	if incl != nil && incl.Data {
 		glog.Infof("data is requested, but not supported yet")
 	}
 	return obj, nil
 }
 
-func (s *configAPIServer) GetObject(ctx context.Context, req *configpb.GetObjectRequest) (resp *configpb.Object, err error) {
-	value, index, found := s.kvs.Get(s.buildPath(req.Meta))
-	if !found {
-		return nil, fmt.Errorf("object not found")
-	}
-	resp, err = s.buildObject(value, req.Meta, req.Incl)
+func readKvsToObjects(kvs store.KeyValueStore, prefix string, incl *configpb.ObjectFieldInclude) (objs []*configpb.Object, revision int64, err error) {
+	keys, index, err := kvs.List(prefix, true)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	resp.Meta.Revision = int64(index)
-	return resp, nil
-}
-
-func (s *configAPIServer) ListObjects(ctx context.Context, req *configpb.ListObjectsRequest) (resp *configpb.ObjectList, err error) {
-	keys, index, err := s.kvs.List(s.buildPath(req.Meta), true)
-	if err != nil {
-		return nil, err
-	}
-	resp = &configpb.ObjectList{Meta: req.Meta}
-	resp.Meta.Revision = int64(index)
 	for _, k := range keys {
-		m, err := s.pathToMeta(k)
+		m, err := pathToMeta(k)
 		if err != nil {
 			glog.Warningf("error on key: %v", err)
 			continue
 		}
 		var obj *configpb.Object
-		if req.Incl != nil && (req.Incl.SourceData || req.Incl.Data) {
-			value, gindex, found := s.kvs.Get(s.buildPath(m))
+		if incl != nil && (incl.SourceData || incl.Data) {
+			value, gindex, found := kvs.Get(k)
 			if !found {
-				glog.Warningf("not found: %+v", m)
+				glog.Warningf("not found: %s", k)
 				continue
 			}
-			obj, err = s.buildObject(value, m, req.Incl)
+			obj, err = buildObject(value, m, incl)
 			if err != nil {
 				glog.Warningf("error on fetching the content for %s: %v", k, err)
 				continue
@@ -167,9 +156,34 @@ func (s *configAPIServer) ListObjects(ctx context.Context, req *configpb.ListObj
 			obj = &configpb.Object{Meta: m}
 			obj.Meta.Revision = int64(index)
 		}
-		resp.Objects = append(resp.Objects, obj)
+		objs = append(objs, obj)
 	}
+	return objs, int64(index), err
+}
+
+func (s *configAPIServer) GetObject(ctx context.Context, req *configpb.GetObjectRequest) (resp *configpb.Object, err error) {
+	value, index, found := s.kvs.Get(buildPath(req.Meta))
+	if !found {
+		return nil, fmt.Errorf("object not found")
+	}
+	resp, err = buildObject(value, req.Meta, req.Incl)
+	if err != nil {
+		return nil, err
+	}
+	resp.Meta.Revision = int64(index)
 	return resp, nil
+}
+
+func (s *configAPIServer) ListObjects(ctx context.Context, req *configpb.ListObjectsRequest) (resp *configpb.ObjectList, err error) {
+	objs, revision, err := readKvsToObjects(s.kvs, buildPath(req.Meta), req.Incl)
+	if err != nil {
+		return nil, err
+	}
+	req.Meta.Revision = revision
+	return &configpb.ObjectList{
+		Meta:    req.Meta,
+		Objects: objs,
+	}, nil
 }
 
 func (s *configAPIServer) ListObjectTypes(ctx context.Context, req *configpb.ListObjectTypesRequest) (resp *configpb.ObjectTypeList, err error) {
@@ -186,13 +200,13 @@ func (s *configAPIServer) ListObjectTypes(ctx context.Context, req *configpb.Lis
 	}
 	known := map[string]bool{}
 	for _, k := range keys {
-		m, err := s.pathToMeta(k)
+		m, err := pathToMeta(k)
 		if err != nil {
 			glog.Infof("can't parse key %s: %v", k, err)
 			continue
 		}
 		m.Name = ""
-		mKey := s.buildPath(m)
+		mKey := buildPath(m)
 		if _, ok := known[mKey]; ok {
 			continue
 		}
@@ -207,7 +221,7 @@ func (s *configAPIServer) CreateObject(ctx context.Context, req *configpb.Create
 	if err != nil {
 		return nil, err
 	}
-	index, err := s.kvs.Set(s.buildPath(req.Meta), string(value))
+	index, err := s.kvs.Set(buildPath(req.Meta), string(value))
 	if err != nil {
 		return nil, err
 	}
@@ -221,11 +235,11 @@ func (s *configAPIServer) UpdateObject(ctx context.Context, req *configpb.Update
 }
 
 func (s *configAPIServer) DeleteObject(ctx context.Context, req *configpb.DeleteObjectRequest) (resp *pb.Empty, err error) {
-	err = s.kvs.Delete(s.buildPath(req.Meta))
+	err = s.kvs.Delete(buildPath(req.Meta))
 	return &pb.Empty{}, err
 }
 
-func (s *configAPIServer) check() {
+func (s *configWatcherServer) check() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.lastFetchedIndex < s.lastNotifiedIndex {
@@ -242,24 +256,23 @@ func (s *configAPIServer) check() {
 		toSend := s.filterEvents(s.watchers, changes)
 		for id, evs := range toSend {
 			s.watchers[id].stream.Send(&configpb.WatchResponse{
-				WatchId:      id,
-				ResponseType: configpb.DATA,
+				WatchId: id,
 				Status: &rpc.Status{
 					Code: int32(rpc.OK),
 				},
-				Events: evs,
+				ResponseUnion: &configpb.WatchResponse_Events{&configpb.WatchEvents{evs}},
 			})
 		}
 	}
 }
 
-func (s *configAPIServer) NotifyStoreChanged(index int) {
+func (s *configWatcherServer) NotifyStoreChanged(index int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastNotifiedIndex = index
 }
 
-func (s *configAPIServer) filterEvents(watchers map[int64]*watcher, changes []store.Change) map[int64][]*configpb.Event {
+func (s *configWatcherServer) filterEvents(watchers map[int64]*watcher, changes []store.Change) map[int64][]*configpb.Event {
 	toSend := map[int64][]*configpb.Event{}
 
 	sort.Slice(changes, func(i, j int) bool {
@@ -276,7 +289,7 @@ func (s *configAPIServer) filterEvents(watchers map[int64]*watcher, changes []st
 	}
 
 	for _, c := range filtered {
-		meta, err := s.pathToMeta(c.Key)
+		meta, err := pathToMeta(c.Key)
 		if err != nil {
 			glog.Warningf("%v", err)
 			continue
@@ -298,7 +311,7 @@ func (s *configAPIServer) filterEvents(watchers map[int64]*watcher, changes []st
 					if found {
 						glog.Warningf("failed to fetch data for key %s", c.Key)
 					}
-					ev.Kv, err = s.buildObject(data, ev.Kv.Meta, &configpb.ObjectFieldInclude{Data: true, SourceData: true})
+					ev.Kv, err = buildObject(data, ev.Kv.Meta, &configpb.ObjectFieldInclude{Data: true, SourceData: true})
 					if err != nil {
 						glog.Warningf("failed to builds an object for key %s: %v", c.Key, err)
 					}
@@ -311,41 +324,40 @@ func (s *configAPIServer) filterEvents(watchers map[int64]*watcher, changes []st
 	return toSend
 }
 
-func (s *configAPIServer) startWatch(req *configpb.WatchCreateRequest, stream configpb.Service_WatchServer) {
+func (s *configWatcherServer) startWatch(req *configpb.WatchCreateRequest, stream configpb.Watcher_WatchServer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	objs, _, err := readKvsToObjects(s.kvs, buildPath(req.Subtree), &configpb.ObjectFieldInclude{true, true})
+	if err != nil {
+		stream.Send(&configpb.WatchResponse{
+			Status: &rpc.Status{
+				Code:    int32(rpc.INTERNAL),
+				Message: err.Error(),
+			},
+		})
+		return
+	}
+
 	id := s.nextWatcherID
 	s.nextWatcherID++
-	w := &watcher{
-		keyPrefix:            s.buildPath(req.Key),
+	s.watchers[id] = &watcher{
+		keyPrefix:            buildPath(req.Subtree),
 		stream:               stream,
 		lastNotifiedRevision: req.StartRevision - 1,
 	}
-	resp := &configpb.WatchResponse{
-		WatchId:      id,
-		ResponseType: configpb.WATCH_CREATED,
-	}
-	changes, err := s.cr.Read(int(req.StartRevision))
-	if err == nil {
-		resp.Status = &rpc.Status{Code: int32(rpc.OK)}
-		events := s.filterEvents(map[int64]*watcher{id: w}, changes)
-		resp.Events = events[id]
-		s.watchers[id] = w
-	} else {
-		resp.Status = &rpc.Status{
-			Code:    int32(rpc.INTERNAL),
-			Message: err.Error(),
-		}
-	}
-	stream.Send(resp)
+	stream.Send(&configpb.WatchResponse{
+		WatchId:       id,
+		Status:        &rpc.Status{Code: int32(rpc.OK)},
+		ResponseUnion: &configpb.WatchResponse_Created{&configpb.WatchCreated{objs}},
+	})
 }
 
-func (s *configAPIServer) cancelWatch(req *configpb.WatchCancelRequest, stream configpb.Service_WatchServer) {
+func (s *configWatcherServer) cancelWatch(req *configpb.WatchCancelRequest, stream configpb.Watcher_WatchServer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &configpb.WatchResponse{
-		WatchId:      req.WatchId,
-		ResponseType: configpb.WATCH_CANCELED,
+		WatchId:       req.WatchId,
+		ResponseUnion: &configpb.WatchResponse_Canceled{&configpb.WatchCanceled{}},
 	}
 	_, found := s.watchers[req.WatchId]
 	if found {
@@ -362,7 +374,7 @@ func (s *configAPIServer) cancelWatch(req *configpb.WatchCancelRequest, stream c
 	stream.Send(resp)
 }
 
-func (s *configAPIServer) Watch(stream configpb.Service_WatchServer) error {
+func (s *configWatcherServer) Watch(stream configpb.Watcher_WatchServer) error {
 	for {
 		req, err := stream.Recv()
 		if err != nil {
