@@ -5,8 +5,8 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "go_default_library",
     srcs = [
-        "globalWordList.go",
         "grpcServer.go",
+        ":globalWordList",
     ],
     deps = [
         "//pkg/adapter:go_default_library",
@@ -32,6 +32,14 @@ go_library(
         "@org_golang_google_grpc//stats:go_default_library",
         "@org_golang_x_net//context:go_default_library",
     ],
+)
+
+genrule(
+    name = "globalWordList",
+    srcs = ["@com_github_istio_api//:global_dictionary"],
+    outs = ["globalWordList.go"],
+    cmd = "$(location //tools/codegen/cmd/globaldictgen) $(location @com_github_istio_api//:global_dictionary) > $@",
+    tools = ["//tools/codegen/cmd/globaldictgen"],
 )
 
 go_test(

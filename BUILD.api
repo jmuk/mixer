@@ -104,3 +104,8 @@ gogoslick_proto_library(
         "@com_github_gogo_protobuf//types:go_default_library",
     ],
 )
+
+filegroup(
+    name = "global_dictionary",
+    srcs = ["mixer/v1/global_dictionary.yaml"],
+)
