@@ -15,19 +15,20 @@
 package config
 
 import (
-	"crypto/sha1"
+	"context"
 	"errors"
-	"reflect"
+	"fmt"
 	"sync"
-	"time"
 
+	jsonpb "github.com/gogo/protobuf/jsonpb"
 	"github.com/golang/glog"
+	rpc "github.com/googleapis/googleapis/google/rpc"
 
+	galley "istio.io/api/galley/v1"
 	"istio.io/mixer/pkg/adapter"
 	"istio.io/mixer/pkg/attribute"
 	"istio.io/mixer/pkg/config/descriptor"
 	pb "istio.io/mixer/pkg/config/proto"
-	"istio.io/mixer/pkg/config/store"
 	"istio.io/mixer/pkg/expr"
 )
 
@@ -45,29 +46,25 @@ type ChangeListener interface {
 	ConfigChange(cfg Resolver, df descriptor.Finder)
 }
 
+type validateFunc func(map[string]string) (*Validated, descriptor.Finder, *adapter.ConfigErrors)
+
 // Manager represents the config Manager.
 // It is responsible for fetching and receiving configuration changes.
 // It applies validated changes to the registered config change listeners.
 // api.Handler listens for config changes.
 type Manager struct {
-	eval          expr.Evaluator
-	aspectFinder  AspectValidatorFinder
-	builderFinder BuilderValidatorFinder
-	findAspects   AdapterToAspectMapper
-	loopDelay     time.Duration
-	store         store.KeyValueStore
-	validate      validateFunc
-
-	// attribute around which scopes and subjects are organized.
+	eval                    expr.Evaluator
+	validate                validateFunc
 	identityAttribute       string
 	identityAttributeDomain string
 
-	ticker         *time.Ticker
-	lastFetchIndex int
+	watcher      galley.WatcherClient
+	data         map[string]string
+	s            galley.Watcher_WatchClient
+	lastRevision int64
 
 	cl []ChangeListener
 
-	lastValidated *Validated
 	sync.RWMutex
 	lastError error
 }
@@ -84,15 +81,12 @@ type Manager struct {
 // GlobalConfig specifies the location of Global Config.
 // ServiceConfig specifies the location of Service config.
 func NewManager(eval expr.Evaluator, aspectFinder AspectValidatorFinder, builderFinder BuilderValidatorFinder,
-	findAspects AdapterToAspectMapper, store store.KeyValueStore, loopDelay time.Duration, identityAttribute string,
+	findAspects AdapterToAspectMapper, watcher galley.WatcherClient, identityAttribute string,
 	identityAttributeDomain string) *Manager {
 	m := &Manager{
 		eval:                    eval,
-		aspectFinder:            aspectFinder,
-		builderFinder:           builderFinder,
-		findAspects:             findAspects,
-		loopDelay:               loopDelay,
-		store:                   store,
+		watcher:                 watcher,
+		data:                    map[string]string{},
 		identityAttribute:       identityAttribute,
 		identityAttributeDomain: identityAttributeDomain,
 		validate: func(cfg map[string]string) (*Validated, descriptor.Finder, *adapter.ConfigErrors) {
@@ -105,94 +99,14 @@ func NewManager(eval expr.Evaluator, aspectFinder AspectValidatorFinder, builder
 	return m
 }
 
-// StoreChange is called by "store" when new changes are available
-//func (c *Manager) StoreChange(index int) {
-//	// fetchAndNotify already logs errors
-//	c.fetchAndNotify()
-//}
-
 // Register makes the ConfigManager aware of a ConfigChangeListener.
 func (c *Manager) Register(cc ChangeListener) {
 	c.cl = append(c.cl, cc)
 }
 
-func readdb(store store.KeyValueStore, prefix string) (map[string]string, map[string][sha1.Size]byte, int, error) {
-	keys, index, err := store.List(prefix, true)
-	if err != nil {
-		return nil, nil, index, err
-	}
-
-	// read
-	shas := map[string][sha1.Size]byte{}
-	data := map[string]string{}
-
-	var found bool
-	var val string
-
-	for _, k := range keys {
-		val, index, found = store.Get(k)
-		if !found {
-			continue
-		}
-		data[k] = val
-		shas[k] = sha1.Sum([]byte(val))
-	}
-
-	return data, shas, index, nil
-}
-
-//  /scopes/global/subjects/global/rules
-//  /scopes/global/adapters
-//  /scopes/global/descriptors
-
-// fetch config and return runtime if a new one is available.
-func (c *Manager) fetch() (*runtime, descriptor.Finder, error) {
-
-	data, shas, index, err := readdb(c.store, "/")
-	if glog.V(9) {
-		glog.Info(data)
-	}
-	if err != nil {
-		return nil, nil, errors.New("Unable to read database: " + err.Error())
-	}
-	// check if sha has changed.
-	if c.lastValidated != nil && reflect.DeepEqual(shas, c.lastValidated.shas) {
-		// nothing actually changed.
-		return nil, nil, nil
-	}
-
-	var vd *Validated
-	var finder descriptor.Finder
-	var cerr *adapter.ConfigErrors
-
-	vd, finder, cerr = c.validate(data)
-	if cerr != nil {
-		glog.Warningf("Validation failed: %v", cerr)
-		return nil, nil, cerr
-	}
-	c.lastFetchIndex = index
-	vd.shas = shas
-	c.lastValidated = vd
-	return newRuntime(vd, c.eval, c.identityAttribute, c.identityAttributeDomain), finder, nil
-}
-
-// fetchAndNotify fetches a new config and notifies listeners if something has changed
-func (c *Manager) fetchAndNotify() {
-	rt, df, err := c.fetch()
-	if err != nil {
-		c.Lock()
-		c.lastError = err
-		c.Unlock()
-		glog.Warningf("Error loading new config %v", err)
-	}
-	if rt == nil {
-		return
-	}
-
-	glog.Infof("Loaded new config %s", c.store)
-	for _, cl := range c.cl {
-		cl.ConfigChange(rt, df)
-	}
+// Close stops the config manager go routine.
+func (c *Manager) Close() {
+	c.s.CloseSend()
 }
 
 // LastError returns last error encountered by the manager while processing config.
@@ -203,27 +117,151 @@ func (c *Manager) LastError() (err error) {
 	return err
 }
 
-// Close stops the config manager go routine.
-func (c *Manager) Close() {
-	if c.ticker != nil {
-		c.ticker.Stop()
+func (c *Manager) validateAndNotify() {
+	fmt.Printf("validating: %+v\n", c.data)
+	vd, finder, cerr := c.validate(c.data)
+	if cerr != nil {
+		c.Lock()
+		c.lastError = cerr
+		c.Unlock()
+		glog.Warningf("Validation failed: %v", cerr)
+		return
+	}
+	rt := newRuntime(vd, c.eval, c.identityAttribute, c.identityAttributeDomain)
+	for _, cl := range c.cl {
+		cl.ConfigChange(rt, finder)
 	}
 }
 
+func (c *Manager) toKey(meta *galley.Meta) string {
+	if meta.ObjectGroup == "" {
+		return fmt.Sprintf("/scopes/%s/%s", meta.Name, meta.ObjectType)
+	}
+	return fmt.Sprintf("/scopes/%s/subjects/%s/%s", meta.ObjectGroup, meta.Name, meta.ObjectType)
+}
+
+func (c *Manager) startWatch(otype string) (int64, []*galley.WatchResponse, error) {
+	err := c.s.Send(&galley.WatchRequest{
+		RequestUnion: &galley.WatchRequest_CreateRequest{&galley.WatchCreateRequest{
+			Subtree: &galley.Meta{
+				ApiGroup:          "core",
+				ObjectType:        otype,
+				ObjectTypeVersion: "v1",
+			},
+			StartRevision: 0,
+		}},
+	})
+	if err != nil {
+		return -1, nil, err
+	}
+	otherResps := []*galley.WatchResponse{}
+	for {
+		resp, err := c.s.Recv()
+		if err != nil {
+			return -1, nil, err
+		}
+		created := resp.GetCreated()
+		if created == nil {
+			otherResps = append(otherResps, resp)
+			continue
+		}
+		if resp.Status.Code != int32(rpc.OK) {
+			return -1, nil, errors.New(resp.Status.Message)
+		}
+		for _, o := range created.InitialState {
+			key := c.toKey(o.Meta)
+			v, err := (&jsonpb.Marshaler{}).MarshalToString(o.SourceData)
+			if err != nil {
+				glog.Errorf("failed to serialize: %v", err)
+				continue
+			}
+			c.data[key] = v
+		}
+		if created.CurrentRevision > c.lastRevision {
+			c.lastRevision = created.CurrentRevision
+		}
+		return resp.WatchId, otherResps, nil
+	}
+}
+
+func (c *Manager) applyChanges(changes []*galley.Event) {
+	for _, change := range changes {
+		key := c.toKey(change.Kv.Meta)
+		if change.Type == galley.DELETE {
+			delete(c.data, key)
+		} else {
+			v, err := (&jsonpb.Marshaler{}).MarshalToString(change.Kv.SourceData)
+			if err != nil {
+				glog.Errorf("failed to marshal: %v", err)
+				continue
+			}
+			c.data[key] = v
+		}
+	}
+}
+
+func (c *Manager) initialFetchAndVerify() error {
+	s, err := c.watcher.Watch(context.Background())
+	if err != nil {
+		return err
+	}
+	c.s = s
+	_, resps, err := c.startWatch("adapters")
+	if err != nil {
+		return err
+	}
+	_, resps2, err := c.startWatch("descriptors")
+	if err != nil {
+		return err
+	}
+	resps = append(resps, resps2...)
+	_, resps2, err = c.startWatch("rules")
+	if err != nil {
+		return err
+	}
+	resps = append(resps, resps2...)
+	for _, resp := range resps {
+		if evs := resp.GetEvents(); evs != nil {
+			c.applyChanges(evs.Events)
+		} else if p := resp.GetProgress(); p != nil && p.CurrentRevision > c.lastRevision {
+			c.lastRevision = p.CurrentRevision
+		}
+	}
+	c.validateAndNotify()
+	return nil
+}
+
 func (c *Manager) loop() {
-	for range c.ticker.C {
-		c.fetchAndNotify()
+	for {
+		resp, err := c.s.Recv()
+		if err != nil {
+			c.Lock()
+			c.lastError = err
+			c.Unlock()
+			break
+		}
+		if resp.Status.Code != int32(rpc.OK) {
+			glog.Errorf("watch failure: %d %s", resp.Status.Code, resp.Status.Message)
+			continue
+		}
+		if evs := resp.GetEvents(); evs != nil {
+			c.applyChanges(evs.Events)
+			c.validateAndNotify()
+		} else if p := resp.GetProgress(); p != nil && p.CurrentRevision > c.lastRevision {
+			c.lastRevision = p.CurrentRevision
+		}
+		// todo: handle watchcanceled result.
 	}
 }
 
 // Start watching for configuration changes and handle updates.
 func (c *Manager) Start() {
-	c.fetchAndNotify()
-	// FIXME add change notifier registration once we have
-	// an adapter that supports it cn.RegisterStoreChangeListener(c)
-
-	// if store does not support notification use the loop
-	// If it is not successful, we will continue to watch for changes.
-	c.ticker = time.NewTicker(c.loopDelay)
+	if err := c.initialFetchAndVerify(); err != nil {
+		c.Lock()
+		c.lastError = err
+		c.Unlock()
+		glog.Errorf("can't initiate the watcher: %v", err)
+		return
+	}
 	go c.loop()
 }

@@ -50,7 +50,7 @@ go_test(
     name = "dispatch_benchmark_test",
     size = "small",
     srcs = [
-        "managerDispatchBenchmark_test.go",
+        #"managerDispatchBenchmark_test.go",
     ],
     library = ":go_default_library",
     deps = [

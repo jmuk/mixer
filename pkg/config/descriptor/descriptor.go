@@ -22,7 +22,6 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/ghodss/yaml"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/glog"
@@ -131,8 +130,8 @@ var typeMap = map[dname]proto.Message{
 func Parse(cfg string) (dcfg *pb.GlobalConfig, ce *adapter.ConfigErrors) {
 	m := map[string]interface{}{}
 	var err error
-	if err = yaml.Unmarshal([]byte(cfg), &m); err != nil {
-		return nil, ce.Append("descriptorConfig", err)
+	if err = json.Unmarshal([]byte(cfg), &m); err != nil {
+		return nil, ce.Append("descriptorConfig", fmt.Errorf("failed to unmarshal: %v", err))
 	}
 	var cerr *adapter.ConfigErrors
 	var oarr reflect.Value

@@ -24,7 +24,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
@@ -36,6 +35,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	galleypb "istio.io/api/galley/v1"
 	mixerpb "istio.io/api/mixer/v1"
 	"istio.io/mixer/adapter"
 	"istio.io/mixer/cmd/shared"
@@ -43,7 +43,6 @@ import (
 	"istio.io/mixer/pkg/api"
 	"istio.io/mixer/pkg/aspect"
 	"istio.io/mixer/pkg/config"
-	"istio.io/mixer/pkg/config/store"
 	"istio.io/mixer/pkg/expr"
 	"istio.io/mixer/pkg/pool"
 	"istio.io/mixer/pkg/tracing"
@@ -74,6 +73,7 @@ type serverArgs struct {
 	configIdentityAttribute       string
 	configIdentityAttributeDomain string
 	monitoringPort                uint16
+	galleyEndpoint                string
 
 	// @deprecated
 	serviceConfigFile string
@@ -117,6 +117,7 @@ func serverCmd(printf, fatalf shared.FormatFn) *cobra.Command {
 	serverCmd.PersistentFlags().BoolVarP(&sa.singleThreaded, "singleThreaded", "", false,
 		"If true, each request to Mixer will be executed in a single go routine (useful for debugging)")
 	serverCmd.PersistentFlags().BoolVarP(&sa.compressedPayload, "compressedPayload", "", false, "Whether to compress gRPC messages")
+	serverCmd.PersistentFlags().StringVar(&sa.galleyEndpoint, "galleyEndpoint", "istio-galley:9096", "The endpoint of the galley server")
 
 	serverCmd.PersistentFlags().StringVarP(&sa.serverCertFile, "serverCertFile", "", "", "The TLS cert file")
 	_ = serverCmd.MarkPersistentFlagFilename("serverCertFile")
@@ -154,28 +155,6 @@ func serverCmd(printf, fatalf shared.FormatFn) *cobra.Command {
 	return &serverCmd
 }
 
-// configStore - given config this function returns a KeyValueStore
-// It provides a compatibility layer so one can continue using serviceConfigFile and globalConfigFile flags
-// until they are removed.
-func configStore(url, serviceConfigFile, globalConfigFile string, printf, fatalf shared.FormatFn) (s store.KeyValueStore) {
-	var err error
-	if url != "" {
-		registry := store.NewRegistry(config.StoreInventory()...)
-		if s, err = registry.NewStore(url); err != nil {
-			fatalf("Failed to get config store: %v", err)
-		}
-		return s
-	}
-	if serviceConfigFile == "" || globalConfigFile == "" {
-		fatalf("Missing configStoreURL")
-	}
-	printf("*** serviceConfigFile and globalConfigFile are deprecated, use configStoreURL")
-	if s, err = config.NewCompatFSStore(globalConfigFile, serviceConfigFile); err != nil {
-		fatalf("Failed to get config store: %v", err)
-	}
-	return s
-}
-
 func runServer(sa *serverArgs, printf, fatalf shared.FormatFn) {
 	var err error
 	apiPoolSize := sa.apiWorkerPoolSize
@@ -196,16 +175,22 @@ func runServer(sa *serverArgs, printf, fatalf shared.FormatFn) {
 		fatalf("Failed to create expression evaluator with cache size %d: %v", expressionEvalCacheSize, err)
 	}
 	adapterMgr := adapterManager.NewManager(adapter.Inventory(), aspect.Inventory(), eval, gp, adapterGP)
-	store := configStore(sa.configStoreURL, sa.serviceConfigFile, sa.globalConfigFile, printf, fatalf)
+	var watchConn *grpc.ClientConn
+	// TODO: should use secure connection?
+	watchConn, err = grpc.Dial(
+		sa.galleyEndpoint,
+		grpc.WithInsecure(),
+		grpc.WithDecompressor(grpc.NewGZIPDecompressor()),
+		grpc.WithCompressor(grpc.NewGZIPCompressor()),
+	)
+	if err != nil {
+		fatalf("Failed to connect to the galley server")
+	}
 	configManager := config.NewManager(eval, adapterMgr.AspectValidatorFinder, adapterMgr.BuilderValidatorFinder,
 		adapterMgr.SupportedKinds,
-		store, time.Second*time.Duration(sa.configFetchIntervalSec),
+		galleypb.NewWatcherClient(watchConn),
 		sa.configIdentityAttribute,
 		sa.configIdentityAttributeDomain)
-
-	configAPIServer := config.NewAPI("v1", sa.configAPIPort, eval,
-		adapterMgr.AspectValidatorFinder, adapterMgr.BuilderValidatorFinder,
-		adapterMgr.SupportedKinds, store)
 
 	var serverCert *tls.Certificate
 	var clientCerts *x509.CertPool
@@ -275,9 +260,6 @@ func runServer(sa *serverArgs, printf, fatalf shared.FormatFn) {
 
 	configManager.Register(adapterMgr)
 	configManager.Start()
-
-	printf("Starting Config API server on port %v", sa.configAPIPort)
-	go configAPIServer.Run()
 
 	var monitoringListener net.Listener
 	// get the network stuff setup

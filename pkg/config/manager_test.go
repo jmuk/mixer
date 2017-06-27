@@ -15,16 +15,24 @@
 package config
 
 import (
-	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ghodss/yaml"
+	"github.com/gogo/protobuf/jsonpb"
+	"github.com/gogo/protobuf/types"
+	rpc "github.com/googleapis/googleapis/google/rpc"
+	"golang.org/x/net/context"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+
+	galley "istio.io/api/galley/v1"
 	"istio.io/mixer/pkg/adapter"
 	"istio.io/mixer/pkg/config/descriptor"
-	"istio.io/mixer/pkg/config/store"
 )
 
 const (
@@ -83,54 +91,11 @@ func TestConfigManager(t *testing.T) {
 		t.Run(strconv.Itoa(idx), func(t *testing.T) {
 			loopDelay := time.Millisecond * 50
 			vf := newVfinder(mt.ada, mt.asp)
-			store := newFakeStore(mt.gcContent, mt.scContent)
-			if mt.errStr != "" {
-				store.err = errors.New(mt.errStr)
-			}
+			watcher := newFakeWatcher(mt.gcContent, mt.scContent)
 			ma := NewManager(evaluator, vf.FindAspectValidator, vf.FindAdapterValidator, vf.AdapterToAspectMapperFunc,
-				store, loopDelay, keyTargetService, keyServiceDomain)
+				watcher, keyTargetService, keyServiceDomain)
 			testConfigManager(t, ma, mt, loopDelay)
 		})
-	}
-}
-
-func TestManager_FetchError(t *testing.T) {
-	loopDelay := time.Millisecond * 50
-	errStr := "TestManager_FetchError"
-	store := newFakeStore("{}", "{}")
-	mgr := NewManager(nil, nil, nil, nil,
-		store, loopDelay, keyTargetService, keyServiceDomain)
-
-	mgr.validate = func(cfg map[string]string) (rt *Validated, desc descriptor.Finder, ce *adapter.ConfigErrors) {
-		ce = ce.Appendf("ABC", errStr)
-		return nil, nil, ce
-	}
-
-	testConfigManager(t, mgr, mtest{errStr: errStr}, loopDelay)
-
-}
-
-func TestManager_readdb(t *testing.T) {
-	// testing modification between list and get
-	commonKey := "AA"
-	store := &fakeMemStore{
-		data: map[string]string{
-			commonKey: commonKey,
-			"BB":      "BB",
-		},
-	}
-	store.listKeys = []string{"NOTFOUND", commonKey}
-
-	// store.List will report additional key, which is not present anymore.
-
-	data, _, _, _ := readdb(store, "/")
-
-	if len(data) != 1 {
-		t.Errorf("got len=%d, want len=1", len(data))
-	}
-
-	if data[commonKey] != store.data[commonKey] {
-		t.Errorf("got %s, want %s", data[commonKey], store.data[commonKey])
 	}
 }
 
@@ -176,116 +141,100 @@ func testConfigManager(t *testing.T, mgr *Manager, mt mtest, loopDelay time.Dura
 	}
 }
 
-// fakeMemStore
+// fakeWatcher
 
-type fakeMemStore struct {
-	data     map[string]string
-	index    int
-	err      error
-	writeErr error
-
-	cl store.Listener
-	sync.RWMutex
-
-	listKeys []string
+type fakeWatcher struct {
+	data map[string][]*galley.ConfigObject
 }
 
-var _ store.KeyValueStore = &fakeMemStore{}
-var _ store.ChangeNotifier = &fakeMemStore{}
-
-func (f *fakeMemStore) String() string {
-	return "fakeMemStore"
+func (w *fakeWatcher) Watch(ctx context.Context, opts ...grpc.CallOption) (galley.Watcher_WatchClient, error) {
+	return &fakeWatchStream{ctx: ctx, data: w.data}, nil
 }
 
-// Get value at a key, false if not found.
-func (f *fakeMemStore) Get(key string) (value string, index int, found bool) {
-	f.RLock()
-	defer f.RUnlock()
+func newFakeWatcher(gc string, sc string) *fakeWatcher {
+	gcjson, _ := yaml.YAMLToJSON([]byte(gc))
+	gcpb := &types.Struct{}
+	jsonpb.UnmarshalString(string(gcjson), gcpb)
 
-	if f.err != nil {
-		return "", f.index, false
+	scjson, _ := yaml.YAMLToJSON([]byte(sc))
+	scpb := &types.Struct{}
+	jsonpb.UnmarshalString(string(scjson), scpb)
+	return &fakeWatcher{
+		map[string][]*galley.ConfigObject{
+			"adapters": {
+				{
+					Meta:       &galley.Meta{ApiGroup: "core", ObjectType: "adapters", ObjectTypeVersion: "v1", Name: "global"},
+					SourceData: gcpb,
+				},
+			},
+			"descriptors": {
+				{
+					Meta:       &galley.Meta{ApiGroup: "core", ObjectType: "descriptors", ObjectTypeVersion: "v1", Name: "global"},
+					SourceData: &types.Struct{},
+				},
+			},
+			"rules": {
+				{
+					Meta:       &galley.Meta{ApiGroup: "core", ObjectType: "rules", ObjectTypeVersion: "v1", ObjectGroup: "global", Name: "global"},
+					SourceData: scpb,
+				},
+			},
+		},
 	}
-	v, found := f.data[key]
-	return v, f.index, found
 }
 
-// Set a value
-func (f *fakeMemStore) Set(key string, value string) (index int, err error) {
-	f.Lock()
-	defer f.Unlock()
-	if f.writeErr != nil {
-		return f.index, f.writeErr
-	}
-
-	f.index++
-	f.data[key] = value
-
-	go func(idx int, cl store.Listener) {
-		if cl != nil {
-			cl.NotifyStoreChanged(idx)
-		}
-	}(f.index, f.cl)
-
-	return f.index, f.writeErr
+type fakeWatchStream struct {
+	resps []*galley.WatchResponse
+	data  map[string][]*galley.ConfigObject
+	ctx   context.Context
 }
 
-// List keys with the prefix
-func (f *fakeMemStore) List(key string, recurse bool) (keys []string, index int, err error) {
-	f.RLock()
-	defer f.RUnlock()
-	if f.err != nil {
-		return nil, f.index, f.err
+func (s *fakeWatchStream) Send(req *galley.WatchRequest) error {
+	if create := req.GetCreateRequest(); create != nil {
+		s.resps = append(s.resps, &galley.WatchResponse{
+			Status: &rpc.Status{Code: int32(rpc.OK)},
+			ResponseUnion: &galley.WatchResponse_Created{
+				&galley.WatchCreated{
+					InitialState:    s.data[create.Subtree.ObjectType],
+					CurrentRevision: 0,
+				},
+			},
+		})
+		return nil
 	}
-
-	if f.listKeys != nil {
-		return f.listKeys, f.index, f.err
-	}
-
-	for k := range f.data {
-		if strings.HasPrefix(k, key) {
-			keys = append(keys, k)
-		}
-	}
-	index = f.index
-	return
+	// watch cancel is not supported yet.
+	return fmt.Errorf("should not reach: %+v", req)
 }
 
-// Delete
-func (f *fakeMemStore) Delete(key string) error {
-	f.Lock()
-	defer f.Unlock()
-	if f.err != nil {
-		return f.err
+func (s *fakeWatchStream) Recv() (*galley.WatchResponse, error) {
+	if len(s.resps) == 0 {
+		return nil, fmt.Errorf("ended")
 	}
+	resp := s.resps[0]
+	s.resps = s.resps[1:]
+	return resp, nil
+}
 
-	delete(f.data, key)
+func (s *fakeWatchStream) Header() (metadata.MD, error) {
+	return nil, fmt.Errorf("not supported")
+}
+
+func (s *fakeWatchStream) Trailer() metadata.MD {
 	return nil
 }
 
-// Close
-func (f *fakeMemStore) Close() {
+func (s *fakeWatchStream) CloseSend() error {
+	return nil
 }
 
-func (f *fakeMemStore) RegisterListener(s store.Listener) {
-	f.cl = s
+func (s *fakeWatchStream) Context() context.Context {
+	return s.ctx
 }
 
-func newFakeStore(gc string, sc string) *fakeMemStore {
-	return &fakeMemStore{
-		data: newFakeMap(gc, sc),
-	}
+func (s *fakeWatchStream) SendMsg(m interface{}) error {
+	return fmt.Errorf("not supported")
 }
 
-func newFakeMap(gc string, sc string) map[string]string {
-	if gc == "" {
-		gc = "{}"
-	}
-	if sc == "" {
-		sc = "{}"
-	}
-	return map[string]string{
-		keyGlobalServiceConfig: sc,
-		keyAdapters:            gc,
-		keyDescriptors:         "{}",
-	}
+func (s *fakeWatchStream) RecvMsg(m interface{}) error {
+	return fmt.Errorf("not supported")
 }

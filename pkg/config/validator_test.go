@@ -15,13 +15,14 @@
 package config
 
 import (
-	"crypto/sha1"
 	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/ghodss/yaml"
 
 	dpb "istio.io/api/mixer/v1/config/descriptor"
 	"istio.io/mixer/pkg/adapter"
@@ -142,9 +143,17 @@ func TestConfigValidatorError(t *testing.T) {
 			mgr := newVfinder(tt.ada, tt.asp)
 			p := newValidator(mgr.FindAspectValidator, mgr.FindAdapterValidator, mgr.AdapterToAspectMapperFunc, tt.strict, evaluator)
 			if tt.cfg == sSvcConfig {
-				ce = p.validateServiceConfig(globalRulesKey, fmt.Sprintf(tt.cfg, tt.selector), false)
+				data, err := yaml.YAMLToJSON([]byte(fmt.Sprintf(tt.cfg, tt.selector)))
+				if err != nil {
+					t.Fatalf("failed to convert: %v", err)
+				}
+				ce = p.validateServiceConfig(globalRulesKey, string(data), false)
 			} else {
-				ce = p.validateAdapters(keyAdapters, tt.cfg)
+				data, err := yaml.YAMLToJSON([]byte(tt.cfg))
+				if err != nil {
+					t.Fatalf("failed to convert: %v", err)
+				}
+				ce = p.validateAdapters(keyAdapters, string(data))
 			}
 			cok := ce == nil
 			ok := tt.nerrors == 0
@@ -223,13 +232,25 @@ func TestFullConfigValidator(tt *testing.T) {
 			},
 			"service.name == “*”", false, sSvcConfig1, errors.New("invalid expression")},
 	}
+	jsonGlobalConfig, err := yaml.YAMLToJSON([]byte(ConstGlobalConfig))
+	if err != nil {
+		tt.Fatalf("failed to convert config: %v", err)
+	}
 	for idx, ctx := range ctable {
 		tt.Run(fmt.Sprintf("[%d]", idx), func(t *testing.T) {
 			mgr := newVfinder(ctx.ada, ctx.asp)
 			fe.err = ctx.exprErr
 			p := newValidator(mgr.FindAspectValidator, mgr.FindAdapterValidator, mgr.AdapterToAspectMapperFunc, ctx.strict, fe)
 			// ConstGlobalConfig only defines 1 adapter: denyChecker
-			_, ce := p.validate(newFakeMap(ConstGlobalConfig, ctx.cfg))
+			jsonCfg, err := yaml.YAMLToJSON([]byte(ctx.cfg))
+			if err != nil {
+				t.Fatalf("failed to convert config: %v", err)
+			}
+			_, ce := p.validate(map[string]string{
+				keyAdapters:            string(jsonGlobalConfig),
+				keyDescriptors:         "{}",
+				keyGlobalServiceConfig: string(jsonCfg),
+			})
 			cok := ce == nil
 			ok := ctx.cerr == nil
 			if ok != cok {
@@ -259,18 +280,18 @@ func TestConfigParseError(t *testing.T) {
 	p := newValidator(mgr.FindAspectValidator, mgr.FindAdapterValidator, mgr.AdapterToAspectMapperFunc, false, evaluator)
 	ce := p.validateServiceConfig(globalRulesKey, "<config>  </config>", false)
 
-	if ce == nil || !strings.Contains(ce.Error(), "error unmarshaling") {
+	if ce == nil || !strings.Contains(ce.Error(), "failed to unmarshal") {
 		t.Error("Expected unmarshal Error", ce)
 	}
 	ce = p.validateAdapters("", "<config>  </config>")
 
-	if ce == nil || !strings.Contains(ce.Error(), "error unmarshaling") {
+	if ce == nil || !strings.Contains(ce.Error(), "failed to unmarshal") {
 		t.Error("Expected unmarshal Error", ce)
 	}
 
 	ce = p.validateDescriptors("", "<config>  </config>")
 
-	if ce == nil || !strings.Contains(ce.Error(), "error unmarshaling") {
+	if ce == nil || !strings.Contains(ce.Error(), "failed to unmarshal") {
 		t.Error("Expected unmarshal Error", ce)
 	}
 	_, ce = p.validate(map[string]string{
@@ -278,7 +299,7 @@ func TestConfigParseError(t *testing.T) {
 		keyAdapters:            "<config>  </config>",
 		keyDescriptors:         "<config>  </config>",
 	})
-	if ce == nil || !strings.Contains(ce.Error(), "error unmarshaling") {
+	if ce == nil || !strings.Contains(ce.Error(), "failed to unmarshal") {
 		t.Error("Expected unmarshal Error", ce)
 	}
 }
@@ -420,10 +441,6 @@ func TestValidated_Clone(t *testing.T) {
 		{"global", "global"}: {},
 	}
 
-	shas := map[string][sha1.Size]byte{
-		keyGlobalServiceConfig: {},
-	}
-
 	adp := map[string]*pb.GlobalConfig{
 		keyAdapters: {},
 	}
@@ -438,7 +455,6 @@ func TestValidated_Clone(t *testing.T) {
 		adapter:       adp,
 		descriptor:    desc,
 		numAspects:    1,
-		shas:          shas,
 	}
 
 	v1 := v.Clone()
@@ -570,7 +586,11 @@ quotas:
 	for idx, tt := range tests {
 		t.Run(fmt.Sprintf("[%d] %s", idx, tt.name), func(t *testing.T) {
 			v := &validator{validated: &Validated{descriptor: make(map[string]*pb.GlobalConfig)}}
-			if err := v.validateDescriptors(tt.name, tt.in); err != nil || tt.err != "" {
+			inJSON, err := yaml.YAMLToJSON([]byte(tt.in))
+			if err != nil {
+				t.Fatalf("failed to convert: %v", err)
+			}
+			if err := v.validateDescriptors(tt.name, string(inJSON)); err != nil || tt.err != "" {
 				if tt.err == "" {
 					t.Fatalf("validateDescriptors = '%s', wanted no err", err.Error())
 				} else if !strings.Contains(err.Error(), tt.err) {

@@ -16,6 +16,7 @@ package descriptor
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"reflect"
@@ -191,7 +192,7 @@ func testParser(mutations map[string]interface{}, wantErr string, t *testing.T) 
 		mutate(m, path, val)
 	}
 
-	if ba, err = yaml.Marshal(m); err != nil {
+	if ba, err = json.Marshal(m); err != nil {
 		t.Fatalf("unable to marshal %v with: %v", m, err)
 	}
 
@@ -220,7 +221,7 @@ func checkError(got error, want string, t *testing.T) {
 func TestParse_BadInput(t *testing.T) {
 	t.Run("Bad_Yaml", func(t *testing.T) {
 		_, err := Parse("<badyaml></badyaml>")
-		checkError(err, "descriptorConfig: error unmarshaling JSON", t)
+		checkError(err, "descriptorConfig: failed to unmarshal", t)
 	})
 
 	t.Run("NonJsonInput", func(t *testing.T) {
@@ -253,14 +254,14 @@ func TestParseErrors(t *testing.T) {
 
 // ensure that Parse and jsonpb.Parse are equivalent
 func TestParseValid(t *testing.T) {
-	dcfg, ce := Parse(allGoodConfig)
-	if ce != nil {
-		t.Fatalf("Unexpected error %s", ce)
-	}
-
 	jsonConfig, err := yaml.YAMLToJSON([]byte(allGoodConfig))
 	if err != nil {
 		t.Fatalf("could not convert to json %s", err)
+	}
+
+	dcfg, ce := Parse(string(jsonConfig))
+	if ce != nil {
+		t.Fatalf("Unexpected error %s", ce)
 	}
 
 	cfg := &pb.GlobalConfig{}

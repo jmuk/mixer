@@ -26,12 +26,10 @@ package config
 
 import (
 	"bytes"
-	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"strings"
 
-	"github.com/ghodss/yaml"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
@@ -87,7 +85,6 @@ func newValidator(managerFinder AspectValidatorFinder, adapterFinder BuilderVali
 			rule:          make(map[rulesKey]*pb.ServiceConfig),
 			adapter:       make(map[string]*pb.GlobalConfig),
 			descriptor:    make(map[string]*pb.GlobalConfig),
-			shas:          make(map[string][sha1.Size]byte),
 		},
 	}
 }
@@ -125,7 +122,6 @@ type (
 		adapter    map[string]*pb.GlobalConfig
 		descriptor map[string]*pb.GlobalConfig
 		rule       map[rulesKey]*pb.ServiceConfig
-		shas       map[string][sha1.Size]byte
 		numAspects int
 	}
 )
@@ -150,18 +146,12 @@ func (v *Validated) Clone() *Validated {
 		rule[k] = a
 	}
 
-	shas := map[string][sha1.Size]byte{}
-	for k, a := range v.shas {
-		shas[k] = a
-	}
-
 	return &Validated{
 		adapterByName: aa,
 		rule:          rule,
 		adapter:       copyDescriptors(v.adapter),
 		descriptor:    copyDescriptors(v.descriptor),
 		numAspects:    v.numAspects,
-		shas:          shas,
 	}
 }
 
@@ -210,7 +200,7 @@ func (a adapterKey) String() string {
 // At present globalConfig.Adapters contains `struct` that prevents us from using proto.jsonp
 
 // compatfilterConfig
-// given a yaml file, filter specific keys from it
+// given a json data, filter specific keys from it
 // globalConfig contains descriptors and adapters which will be split shortly.
 func compatfilterConfig(cfg string, shouldSelect func(string) bool) ([]byte, map[string]interface{}, error) {
 	//data []byte, m map[string]interface{}, err error
@@ -218,7 +208,7 @@ func compatfilterConfig(cfg string, shouldSelect func(string) bool) ([]byte, map
 	var data []byte
 	var err error
 
-	if err = yaml.Unmarshal([]byte(cfg), &m); err != nil {
+	if err = json.Unmarshal([]byte(cfg), &m); err != nil {
 		return data, nil, err
 	}
 
@@ -275,7 +265,7 @@ func (p *validator) validateAdapters(key string, cfg string) (ce *adapter.Config
 	}
 
 	var m = &pb.GlobalConfig{}
-	if err := yaml.Unmarshal(data, m); err != nil {
+	if err := jsonpb.UnmarshalString(string(data), m); err != nil {
 		return ce.Appendf("adapterConfig", "failed to unmarshal config into proto: %v", err)
 	}
 
@@ -424,7 +414,7 @@ func (p *validator) validateServiceConfig(pk rulesKey, cfg string, validatePrese
 	var err error
 	m := &pb.ServiceConfig{}
 	var numAspects int
-	if err = yaml.Unmarshal([]byte(cfg), m); err != nil {
+	if err = (&jsonpb.Unmarshaler{AllowUnknownFields: true}).Unmarshal(strings.NewReader(cfg), m); err != nil {
 		return ce.Appendf("serviceConfig", "failed to unmarshal config into proto: %v", err)
 	}
 
