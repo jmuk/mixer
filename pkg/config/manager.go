@@ -15,22 +15,32 @@
 package config
 
 import (
-	"crypto/sha1"
-	"errors"
-	"reflect"
+	"fmt"
 	"sync"
 	"time"
 
+	"github.com/ghodss/yaml"
 	"github.com/golang/glog"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 
 	"istio.io/mixer/pkg/adapter"
 	"istio.io/mixer/pkg/attribute"
 	"istio.io/mixer/pkg/config/descriptor"
 	pb "istio.io/mixer/pkg/config/proto"
-	"istio.io/mixer/pkg/config/store"
 	"istio.io/mixer/pkg/expr"
 	"istio.io/mixer/pkg/template"
 )
+
+// TODO: should be customized
+const ns = "default"
+
+type validateFunc func(cfg map[string]string) (rt *Validated, desc descriptor.Finder, ce *adapter.ConfigErrors)
 
 // Resolver resolves configuration to a list of combined configs.
 type Resolver interface {
@@ -56,8 +66,14 @@ type Manager struct {
 	builderFinder BuilderValidatorFinder
 	findAspects   AdapterToAspectMapper
 	loopDelay     time.Duration
-	store         store.KeyValueStore
+	ns            string
+	discovery     *discovery.DiscoveryClient
+	dynclient     *dynamic.Client
 	validate      validateFunc
+
+	cached   map[string]map[string]map[string]interface{}
+	watchers map[string]watch.Interface
+	chupdate chan interface{}
 
 	// attribute around which scopes and subjects are organized.
 	identityAttribute       string
@@ -86,15 +102,25 @@ type Manager struct {
 // ServiceConfig specifies the location of Service config.
 func NewManager(eval expr.Evaluator, aspectFinder AspectValidatorFinder, builderFinder BuilderValidatorFinder,
 	getBuilderInfoFns []adapter.GetBuilderInfoFn, findAspects AdapterToAspectMapper, repository template.Repository,
-	store store.KeyValueStore, loopDelay time.Duration, identityAttribute string,
+	config *rest.Config, loopDelay time.Duration, identityAttribute string,
 	identityAttributeDomain string) *Manager {
+	dclient := discovery.NewDiscoveryClientForConfigOrDie(config)
+	config.APIPath = "/apis"
+	config.GroupVersion = &schema.GroupVersion{Group: "config.istio.io", Version: "v1alpha2"}
+	dynclient, err := dynamic.NewClient(config)
+	if err != nil {
+		glog.Infof("failed to create a dynamic client: %v", err)
+		return nil
+	}
 	m := &Manager{
 		eval:                    eval,
 		aspectFinder:            aspectFinder,
 		builderFinder:           builderFinder,
 		findAspects:             findAspects,
 		loopDelay:               loopDelay,
-		store:                   store,
+		discovery:               dclient,
+		dynclient:               dynclient,
+		ns:                      ns,
 		identityAttribute:       identityAttribute,
 		identityAttributeDomain: identityAttributeDomain,
 		validate: func(cfg map[string]string) (*Validated, descriptor.Finder, *adapter.ConfigErrors) {
@@ -108,125 +134,153 @@ func NewManager(eval expr.Evaluator, aspectFinder AspectValidatorFinder, builder
 	return m
 }
 
-// StoreChange is called by "store" when new changes are available
-//func (c *Manager) StoreChange(index int) {
-//	// fetchAndNotify already logs errors
-//	c.fetchAndNotify()
-//}
-
 // Register makes the ConfigManager aware of a ConfigChangeListener.
 func (c *Manager) Register(cc ChangeListener) {
 	c.cl = append(c.cl, cc)
 }
 
-func readdb(store store.KeyValueStore, prefix string) (map[string]string, map[string][sha1.Size]byte, int, error) { // nolint: unparam
-	keys, index, err := store.List(prefix, true)
-	if err != nil {
-		return nil, nil, index, err
-	}
-
-	// read
-	shas := map[string][sha1.Size]byte{}
-	data := map[string]string{}
-
-	var found bool
-	var val string
-
-	for _, k := range keys {
-		val, index, found = store.Get(k)
-		if !found {
-			continue
-		}
-		data[k] = val
-		shas[k] = sha1.Sum([]byte(val))
-	}
-
-	return data, shas, index, nil
-}
-
-//  /scopes/global/subjects/global/rules
-//  /scopes/global/adapters
-//  /scopes/global/descriptors
-
-// fetch config and return runtime if a new one is available.
-func (c *Manager) fetch() (*runtime, descriptor.Finder, error) {
-
-	data, shas, index, err := readdb(c.store, "/")
-	if glog.V(9) {
-		glog.Info(data)
-	}
-	if err != nil {
-		return nil, nil, errors.New("Unable to read database: " + err.Error())
-	}
-	// check if sha has changed.
-	if c.lastValidated != nil && reflect.DeepEqual(shas, c.lastValidated.shas) {
-		// nothing actually changed.
-		return nil, nil, nil
-	}
-
-	var vd *Validated
-	var finder descriptor.Finder
-	var cerr *adapter.ConfigErrors
-
-	vd, finder, cerr = c.validate(data)
-	if cerr != nil {
-		glog.Warningf("Validation failed: %v", cerr)
-		return nil, nil, cerr
-	}
-	c.lastFetchIndex = index
-	vd.shas = shas
-	c.lastValidated = vd
-	return newRuntime(vd, c.eval, c.identityAttribute, c.identityAttributeDomain), finder, nil
-}
-
-// fetchAndNotify fetches a new config and notifies listeners if something has changed
-func (c *Manager) fetchAndNotify() {
-	rt, df, err := c.fetch()
-	if err != nil {
-		c.Lock()
-		c.lastError = err
-		c.Unlock()
-		glog.Warningf("Error loading new config %v", err)
-	}
-	if rt == nil {
-		return
-	}
-
-	glog.Infof("Loaded new config %s", c.store)
-	for _, cl := range c.cl {
-		cl.ConfigChange(rt, df)
-	}
-}
-
-// LastError returns last error encountered by the manager while processing config.
-func (c *Manager) LastError() (err error) {
-	c.RLock()
-	err = c.lastError
-	c.RUnlock()
-	return err
-}
-
 // Close stops the config manager go routine.
 func (c *Manager) Close() {
-	if c.ticker != nil {
-		c.ticker.Stop()
+	for _, w := range c.watchers {
+		w.Stop()
+	}
+	// TODO: there's race condition of chupdate here. Fix it.
+	close(c.chupdate)
+}
+
+func (c *Manager) watch(w watch.Interface, data map[string]map[string]interface{}) {
+	defer w.Stop()
+	for ev := range w.ResultChan() {
+		if ev.Type == watch.Error {
+			glog.Errorf("watch error: %+v", ev.Object)
+			continue
+		}
+		uns := ev.Object.(*unstructured.Unstructured)
+		name := uns.Object["metadata"].(map[string]interface{})["name"].(string)
+		spec := uns.Object["spec"].(map[string]interface{})
+		if ev.Type == watch.Deleted {
+			delete(data, name)
+		} else {
+			data[name] = spec
+		}
+		c.chupdate <- true
 	}
 }
 
-func (c *Manager) loop() {
-	for range c.ticker.C {
-		c.fetchAndNotify()
+func (c *Manager) waitAndConsume(d time.Duration) {
+	after := time.After(d)
+	for {
+		select {
+		case <-c.chupdate:
+			// pass, consume chupdate.
+		case <-after:
+			return
+		}
+	}
+}
+
+func (c *Manager) buildListConfig(m map[string]map[string]interface{}, key, targetKey string, target map[string]string) error {
+	dataList := make([]interface{}, 0, len(m))
+	for _, cfg := range m {
+		dataList = append(dataList, cfg)
+	}
+	listBytes, err := yaml.Marshal(map[string]interface{}{key: dataList})
+	if err != nil {
+		return err
+	}
+	target[targetKey] = string(listBytes)
+	return nil
+}
+
+func (c *Manager) buildMapConfig(m map[string]map[string]interface{}, typeName string, target map[string]string) error {
+	for name, cfg := range m {
+		targetKey := fmt.Sprintf("/scopes/global/subjects/%s/%s", name, typeName)
+		cfgBytes, err := yaml.Marshal(cfg)
+		if err != nil {
+			return err
+		}
+		target[targetKey] = string(cfgBytes)
+	}
+	return nil
+}
+
+func (c *Manager) validateAndBuildRuntime() {
+	// Currently this is very inefficient. We need to refactor the validator.
+	data := map[string]string{}
+
+	if err := c.buildListConfig(c.cached["Adapter"], "adapters", keyAdapters, data); err != nil {
+		glog.Errorf("Failed to build config data: %v", err)
+		return
+	}
+	if err := c.buildListConfig(c.cached["Handler"], "handlers", keyHandlers, data); err != nil {
+		glog.Errorf("Failed to build config data: %v", err)
+		return
+	}
+	if globalDescriptors, ok := c.cached["Descriptor"]["global"]; ok {
+		descBytes, err := yaml.Marshal(globalDescriptors)
+		if err != nil {
+			glog.Errorf("Failed to build config data: %v", err)
+			return
+		}
+		data[keyDescriptors] = string(descBytes)
+	}
+	for key, name := range map[string]string{
+		"Constructor": "constructors",
+		"ActionRule":  "action_rules",
+		"Rule":        "rules",
+	} {
+		if err := c.buildMapConfig(c.cached[key], name, data); err != nil {
+			glog.Errorf("Failed to build config data: %v", err)
+			return
+		}
+	}
+
+	vd, finder, cerr := c.validate(data)
+	if cerr != nil {
+		glog.Warningf("Validation failed: %v", cerr)
+		return
+	}
+	rt := newRuntime(vd, c.eval, c.identityAttribute, c.identityAttributeDomain)
+	glog.Infof("%+v", rt)
+	for _, cl := range c.cl {
+		cl.ConfigChange(rt, finder)
 	}
 }
 
 // Start watching for configuration changes and handle updates.
 func (c *Manager) Start() {
-	c.fetchAndNotify()
-	// FIXME add change notifier registration once we have
-	// an adapter that supports it cn.RegisterStoreChangeListener(c)
-
-	// if store does not support notification use the loop
-	// If it is not successful, we will continue to watch for changes.
-	c.ticker = time.NewTicker(c.loopDelay)
-	go c.loop()
+	c.chupdate = make(chan interface{})
+	c.cached = map[string]map[string]map[string]interface{}{
+		"Adapter":     {},
+		"Descriptor":  {},
+		"Handler":     {},
+		"Constructor": {},
+		"ActionRule":  {},
+		"Rule":        {},
+	}
+	c.watchers = map[string]watch.Interface{}
+	list, err := c.discovery.ServerResourcesForGroupVersion("config.istio.io/v1alpha2")
+	if err != nil {
+		glog.Errorf("can't fetch the resources: %+v", err)
+		return
+	}
+	for _, res := range list.APIResources {
+		if data, ok := c.cached[res.Kind]; ok {
+			w, err := c.dynclient.Resource(&res, c.ns).Watch(metav1.ListOptions{})
+			if err == nil {
+				go c.watch(w, data)
+				c.watchers[res.Kind] = w
+			} else {
+				glog.Errorf("failed to start watching %s: %v", res.Kind, err)
+			}
+		}
+	}
+	// watch emits the initial data as 'ADDED' events. Wait a bit to get the initial status.
+	c.waitAndConsume(time.Second)
+	c.validateAndBuildRuntime()
+	go func() {
+		for range c.chupdate {
+			c.validateAndBuildRuntime()
+		}
+	}()
 }

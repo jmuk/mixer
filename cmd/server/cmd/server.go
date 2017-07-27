@@ -24,6 +24,7 @@ import (
 	"net/http"
 	_ "net/http/pprof" // For profiling / performance investigations
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,6 +37,8 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+	"k8s.io/client-go/tools/clientcmd"
 
 	mixerpb "istio.io/api/mixer/v1"
 	"istio.io/mixer/adapter"
@@ -44,7 +47,6 @@ import (
 	"istio.io/mixer/pkg/api"
 	"istio.io/mixer/pkg/aspect"
 	"istio.io/mixer/pkg/config"
-	"istio.io/mixer/pkg/config/store"
 	"istio.io/mixer/pkg/expr"
 	"istio.io/mixer/pkg/pool"
 	"istio.io/mixer/pkg/template"
@@ -159,27 +161,27 @@ func serverCmd(tmplRepo template.Repository, printf, fatalf shared.FormatFn) *co
 	return &serverCmd
 }
 
-// configStore - given config this function returns a KeyValueStore
-// It provides a compatibility layer so one can continue using serviceConfigFile and globalConfigFile flags
-// until they are removed.
-func configStore(url, serviceConfigFile, globalConfigFile string, printf, fatalf shared.FormatFn) (s store.KeyValueStore) {
-	var err error
-	if url != "" {
-		registry := store.NewRegistry(config.StoreInventory()...)
-		if s, err = registry.NewStore(url); err != nil {
-			fatalf("Failed to get config store: %v", err)
-		}
-		return s
-	}
-	if serviceConfigFile == "" || globalConfigFile == "" {
-		fatalf("Missing configStoreURL")
-	}
-	printf("*** serviceConfigFile and globalConfigFile are deprecated, use configStoreURL")
-	if s, err = config.NewCompatFSStore(globalConfigFile, serviceConfigFile); err != nil {
-		fatalf("Failed to get config store: %v", err)
-	}
-	return s
-}
+// // configStore - given config this function returns a KeyValueStore
+// // It provides a compatibility layer so one can continue using serviceConfigFile and globalConfigFile flags
+// // until they are removed.
+// func configStore(url, serviceConfigFile, globalConfigFile string, printf, fatalf shared.FormatFn) (s store.KeyValueStore) {
+// 	var err error
+// 	if url != "" {
+// 		registry := store.NewRegistry(config.StoreInventory()...)
+// 		if s, err = registry.NewStore(url); err != nil {
+// 			fatalf("Failed to get config store: %v", err)
+// 		}
+// 		return s
+// 	}
+// 	if serviceConfigFile == "" || globalConfigFile == "" {
+// 		fatalf("Missing configStoreURL")
+// 	}
+// 	printf("*** serviceConfigFile and globalConfigFile are deprecated, use configStoreURL")
+// 	if s, err = config.NewCompatFSStore(globalConfigFile, serviceConfigFile); err != nil {
+// 		fatalf("Failed to get config store: %v", err)
+// 	}
+// 	return s
+// }
 
 func runServer(sa *serverArgs, tmplRepo template.Repository, printf, fatalf shared.FormatFn) {
 	printf("Mixer started with args: %#v", sa)
@@ -203,16 +205,20 @@ func runServer(sa *serverArgs, tmplRepo template.Repository, printf, fatalf shar
 		fatalf("Failed to create expression evaluator with cache size %d: %v", expressionEvalCacheSize, err)
 	}
 	adapterMgr := adapterManager.NewManager(adapter.Inventory(), aspect.Inventory(), eval, gp, adapterGP)
-	store := configStore(sa.configStoreURL, sa.serviceConfigFile, sa.globalConfigFile, printf, fatalf)
+	// store := configStore(sa.configStoreURL, sa.serviceConfigFile, sa.globalConfigFile, printf, fatalf)
+	kconfig, err := clientcmd.BuildConfigFromFlags("", filepath.Join(os.Getenv("HOME"), ".kube", "config"))
+	if err != nil {
+		fatalf("Failed to get the k8s config: %+v", err)
+	}
 	configManager := config.NewManager(eval, adapterMgr.AspectValidatorFinder, adapterMgr.BuilderValidatorFinder, adapter.Inventory2(),
 		adapterMgr.SupportedKinds,
-		tmplRepo, store, time.Second*time.Duration(sa.configFetchIntervalSec),
+		tmplRepo, kconfig, time.Second*time.Duration(sa.configFetchIntervalSec),
 		sa.configIdentityAttribute,
 		sa.configIdentityAttributeDomain)
 
-	configAPIServer := config.NewAPI("v1", sa.configAPIPort, eval,
-		adapterMgr.AspectValidatorFinder, adapterMgr.BuilderValidatorFinder, adapter.Inventory2(),
-		adapterMgr.SupportedKinds, store, tmplRepo)
+	// configAPIServer := config.NewAPI("v1", sa.configAPIPort, eval,
+	// 	adapterMgr.AspectValidatorFinder, adapterMgr.BuilderValidatorFinder, adapter.Inventory2(),
+	// 	adapterMgr.SupportedKinds, store, tmplRepo)
 
 	var serverCert *tls.Certificate
 	var clientCerts *x509.CertPool
@@ -310,8 +316,8 @@ func runServer(sa *serverArgs, tmplRepo template.Repository, printf, fatalf shar
 	configManager.Register(adapterMgr)
 	configManager.Start()
 
-	printf("Starting Config API server on port %v", sa.configAPIPort)
-	go configAPIServer.Run()
+	// printf("Starting Config API server on port %v", sa.configAPIPort)
+	// go configAPIServer.Run()
 
 	var monitoringListener net.Listener
 	// get the network stuff setup

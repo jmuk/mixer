@@ -5,7 +5,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "go_default_library",
     srcs = [
-        "apiserver.go",
+        #"apiserver.go",
         "builderInfoRegistry.go",
         "compatStore.go",
         "handler.go",
@@ -36,6 +36,13 @@ go_library(
         "@com_github_googleapis_googleapis//:google/rpc",
         "@com_github_hashicorp_go_multierror//:go_default_library",
         "@com_github_istio_api//:mixer/v1/config/descriptor",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1:go_default_library",
+        "@io_k8s_apimachinery//pkg/apis/meta/v1/unstructured:go_default_library",
+        "@io_k8s_apimachinery//pkg/runtime/schema:go_default_library",
+        "@io_k8s_apimachinery//pkg/watch:go_default_library",
+        "@io_k8s_client_go//discovery:go_default_library",
+        "@io_k8s_client_go//dynamic:go_default_library",
+        "@io_k8s_client_go//rest:go_default_library",
     ],
 )
 

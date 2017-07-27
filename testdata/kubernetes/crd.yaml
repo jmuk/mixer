@@ -1,0 +1,74 @@
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  name: adapters.config.istio.io
+spec:
+  group: config.istio.io
+  version: v1alpha2
+  scope: Cluster
+  names:
+    plural: adapters
+    singular: adapter
+    kind: Adapter
+---
+# maybe split it to multiple kinds (i.e. metrics / logs / quotas / monitored resources / principals?)
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  name: descriptors.config.istio.io
+spec:
+  group: config.istio.io
+  version: v1alpha2
+  scope: Cluster
+  names:
+    plural: descriptors
+    singular: descriptor
+    kind: Descriptor
+---
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  name: constructors.config.istio.io
+spec:
+  group: config.istio.io
+  version: v1alpha2
+  names:
+    plural: constructors
+    singular: constructor
+    kind: Constructor
+---
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  name: handlers.config.istio.io
+spec:
+  group: config.istio.io
+  version: v1alpha2
+  names:
+    plural: handlers
+    singular: handler
+    kind: Handler
+---
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  name: action-rules.config.istio.io
+spec:
+  group: config.istio.io
+  version: v1alpha2
+  names:
+    plural: action-rules
+    singular: action-rule
+    kind: ActionRule
+---
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  name: rules.config.istio.io
+spec:
+  group: config.istio.io
+  version: v1alpha2
+  names:
+    plural: rules
+    singular: rule
+    kind: Rule
