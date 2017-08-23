@@ -27,3 +27,4 @@ buildifier -mode=fix $(find . \( -name BUILD -o -name BUILD.bazel \) -type f)
 buildifier -mode=fix ./*.bzl
 buildifier -mode=fix ./BUILD.ubuntu
 buildifier -mode=fix ./WORKSPACE
+${SCRIPTPATH}/gazelle

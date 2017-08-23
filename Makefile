@@ -35,7 +35,4 @@ coverage:
 racetest:
 	@bazel test --features=race //...
 
-gazelle:
-	@bin/gazelle
-
 .PHONY: build clean test lint fmt coverage racetest gazelle
