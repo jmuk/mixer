@@ -27,7 +27,6 @@ var defaultSeverArgs = serverArgs{
 	apiWorkerPoolSize:             256,
 	adapterWorkerPoolSize:         256,
 	expressionEvalCacheSize:       expr.DefaultCacheSize,
-	configAPIPort:                 0,
 	monitoringPort:                0,
 	singleThreaded:                false,
 	compressedPayload:             false,

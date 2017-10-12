@@ -33,6 +33,8 @@ import (
 	"istio.io/mixer/pkg/template"
 )
 
+type validateFunc func(cfg map[string]string) (rt *Validated, desc descriptor.Finder, ce *adapter.ConfigErrors)
+
 // Resolver resolves configuration to a list of combined configs.
 type Resolver interface {
 	// Resolve resolves configuration to a list of combined configs.

@@ -60,6 +60,7 @@ const (
 	versionPath = "/version"
 )
 
+// nolint: aligncheck
 type serverArgs struct {
 	maxMessageSize                uint
 	maxConcurrentStreams          uint
@@ -67,7 +68,6 @@ type serverArgs struct {
 	adapterWorkerPoolSize         int
 	expressionEvalCacheSize       int
 	port                          uint16
-	configAPIPort                 uint16
 	monitoringPort                uint16
 	singleThreaded                bool
 	compressedPayload             bool
@@ -98,7 +98,6 @@ func (sa *serverArgs) String() string {
 	b.WriteString(fmt.Sprint("adapterWorkerPoolSize: ", s.adapterWorkerPoolSize, "\n"))
 	b.WriteString(fmt.Sprint("expressionEvalCacheSize: ", s.expressionEvalCacheSize, "\n"))
 	b.WriteString(fmt.Sprint("port: ", s.port, "\n"))
-	b.WriteString(fmt.Sprint("configAPIPort: ", s.configAPIPort, "\n"))
 	b.WriteString(fmt.Sprint("monitoringPort: ", s.monitoringPort, "\n"))
 	b.WriteString(fmt.Sprint("singleThreaded: ", s.singleThreaded, "\n"))
 	b.WriteString(fmt.Sprint("compressedPayload: ", s.compressedPayload, "\n"))
@@ -148,7 +147,6 @@ func serverCmd(info map[string]template.Info, adapters []adptr.InfoFn, legacyAda
 
 	serverCmd.PersistentFlags().Uint16VarP(&sa.port, "port", "p", 9091, "TCP port to use for Mixer's gRPC API")
 	serverCmd.PersistentFlags().Uint16Var(&sa.monitoringPort, "monitoringPort", 9093, "HTTP port to use for the exposing mixer self-monitoring information")
-	serverCmd.PersistentFlags().Uint16VarP(&sa.configAPIPort, "configAPIPort", "", 9094, "HTTP port to use for Mixer's Configuration API")
 	serverCmd.PersistentFlags().UintVarP(&sa.maxMessageSize, "maxMessageSize", "", 1024*1024, "Maximum size of individual gRPC messages")
 	serverCmd.PersistentFlags().UintVarP(&sa.maxConcurrentStreams, "maxConcurrentStreams", "", 1024, "Maximum number of outstanding RPCs per connection")
 	serverCmd.PersistentFlags().IntVarP(&sa.apiWorkerPoolSize, "apiWorkerPoolSize", "", 1024, "Max number of goroutines in the API worker pool")
@@ -301,10 +299,6 @@ func setupServer(sa *serverArgs, info map[string]template.Info, adapters []adptr
 		sa.configIdentityAttribute,
 		sa.configIdentityAttributeDomain)
 
-	configAPIServer := config.NewAPI("v1", sa.configAPIPort, evalForLegacy,
-		adapterMgr.AspectValidatorFinder, adapterMgr.BuilderValidatorFinder, adapters,
-		adapterMgr.SupportedKinds, store, repo)
-
 	var serverCert *tls.Certificate
 	var clientCerts *x509.CertPool
 
@@ -398,9 +392,6 @@ func setupServer(sa *serverArgs, info map[string]template.Info, adapters []adptr
 	}
 
 	configManager.Start()
-
-	printf("Starting Config API server on port %v", sa.configAPIPort)
-	go configAPIServer.Run()
 
 	var monitoringListener net.Listener
 	// get the network stuff setup
